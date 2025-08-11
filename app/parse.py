@@ -3,8 +3,16 @@ import requests
 from bs4 import BeautifulSoup
 from time import sleep
 from typing import List, Dict, Optional
+from pydantic import BaseModel
 
 BASE_URL = "https://quotes.toscrape.com"
+
+
+class Quote(BaseModel):
+    text: str
+    author: str
+    tags: str
+    author_link: Optional[str] = None
 
 
 def get_page_soup(url: str) -> BeautifulSoup:
@@ -51,13 +59,13 @@ def get_author_bio(
     soup = get_page_soup(author_url)
     bio = soup.select_one("div.author-description").get_text(strip=True)
     cache[author_url] = bio
-    sleep(1)  # пауза, щоб не навантажувати сервер
+    sleep(1)
     return bio
 
 
 def main(
     output_quotes_csv_path: str,
-    output_authors_csv_path: str
+    output_authors_csv_path: str = "authors.csv"
 ) -> None:
     url = BASE_URL
     all_quotes: List[Dict[str, str]] = []
@@ -69,7 +77,7 @@ def main(
         quotes = parse_quotes_from_soup(soup)
         all_quotes.extend(quotes)
         url = get_next_page_url(soup)
-        sleep(1)  # пауза між запитами
+        sleep(1)
 
     unique_authors = {}
     for quote in all_quotes:
