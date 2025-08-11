@@ -1,9 +1,11 @@
+import ast
 import csv
-import requests
+import json
+from typing import Optional, List
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, field_validator
+import requests
 from time import sleep
-from typing import List, Dict, Optional
-from pydantic import BaseModel
 
 BASE_URL = "https://quotes.toscrape.com"
 
@@ -11,109 +13,91 @@ BASE_URL = "https://quotes.toscrape.com"
 class Quote(BaseModel):
     text: str
     author: str
-    tags: str
+    tags: List[str]
     author_link: Optional[str] = None
 
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        if args and not kwargs:
+            field_names = list(self.__class__.model_fields.keys())
+            kwargs = {field_names[i]: arg for i, arg in enumerate(args)}
+        super().__init__(**kwargs)
 
-def get_page_soup(url: str) -> BeautifulSoup:
-    response = requests.get(url)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
-
-
-def parse_quotes_from_soup(soup: BeautifulSoup) -> List[Dict[str, str]]:
-    quotes_data = []
-    quote_blocks = soup.select("div.quote")
-    for quote in quote_blocks:
-        text = quote.select_one("span.text").get_text(strip=True)
-        author = quote.select_one("small.author").get_text(strip=True)
-        author_link = (
-            BASE_URL + quote.select_one("span a")["href"]
-        )
-        tags = [
-            tag.get_text(strip=True)
-            for tag in quote.select("div.tags a.tag")
-        ]
-        quotes_data.append({
-            "text": text,
-            "author": author,
-            "author_link": author_link,
-            "tags": ", ".join(tags),
-        })
-    return quotes_data
+    @field_validator("tags", mode="before")
+    @classmethod
+    def parse_tags(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            try:
+                return ast.literal_eval(value)
+            except Exception:
+                return [tag.strip() for tag in value.split(",")]
+        return value
 
 
-def get_next_page_url(soup: BeautifulSoup) -> Optional[str]:
-    next_button = soup.select_one("li.next > a")
-    if next_button:
-        return BASE_URL + next_button["href"]
-    return None
+class QuoteParser:
+    def __init__(self, html: str) -> None:
+        self.soup = BeautifulSoup(html, "html.parser")
+
+    def parse(self) -> List[Quote]:
+        quotes = []
+        quote_blocks = self.soup.select("div.quote")
+        for block in quote_blocks:
+            text = block.select_one("span.text").get_text(strip=True)
+            author = block.select_one("small.author").get_text(strip=True)
+            author_link = BASE_URL + block.select_one("span a")["href"]
+            tags = [
+                tag.get_text(strip=True)
+                for tag in block.select("div.tags a.tag")
+            ]
+            quotes.append(Quote(text, author, tags, author_link))
+        return quotes
 
 
-def get_author_bio(
-    author_url: str,
-    cache: Dict[str, str]
-) -> str:
-    if author_url in cache:
-        return cache[author_url]
-    soup = get_page_soup(author_url)
-    bio = soup.select_one("div.author-description").get_text(strip=True)
-    cache[author_url] = bio
-    sleep(1)
-    return bio
+class QuoteCSVWriter:
+    def __init__(self, file_path: str) -> None:
+        self.file_path = file_path
+
+    def write(self, quotes: List[Quote]) -> None:
+        with open(
+                self.file_path, mode="w",
+                newline="", encoding="utf-8"
+        ) as file:
+            writer = csv.writer(file)
+            writer.writerow(["text", "author", "tags", "author_link"])
+            for quote in quotes:
+                writer.writerow([
+                    quote.text,
+                    quote.author,
+                    json.dumps(quote.tags, ensure_ascii=False),
+                    quote.author_link or "",
+                ])
 
 
-def main(
-    output_quotes_csv_path: str,
-    output_authors_csv_path: str = "authors.csv"
-) -> None:
+def main(output_csv_path: str) -> None:
     url = BASE_URL
-    all_quotes: List[Dict[str, str]] = []
-    authors_bio_cache: Dict[str, str] = {}
+    all_quotes: List[Quote] = []
 
     while url:
-        print(f"Parsing page: {url}")
-        soup = get_page_soup(url)
-        quotes = parse_quotes_from_soup(soup)
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            html = response.text
+        except requests.RequestException as e:
+            print(f"Ошибка запроса {url}: {e}. Пропускаем страницу.")
+            break
+
+        parser = QuoteParser(html)
+        quotes = parser.parse()
         all_quotes.extend(quotes)
-        url = get_next_page_url(soup)
+
+        soup = BeautifulSoup(html, "html.parser")
+        next_button = soup.select_one("li.next > a")
+        url = BASE_URL + next_button["href"] if next_button else None
+
         sleep(1)
 
-    unique_authors = {}
-    for quote in all_quotes:
-        if quote["author"] not in unique_authors:
-            unique_authors[quote["author"]] = quote["author_link"]
-
-    authors_data = []
-    for author, link in unique_authors.items():
-        bio = get_author_bio(link, authors_bio_cache)
-        authors_data.append({
-            "author": author,
-            "bio": bio,
-        })
-
-    with open(
-            output_quotes_csv_path, "w", newline="", encoding="utf-8"
-    ) as csvfile:
-        fieldnames = ["text", "author", "tags"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for quote in all_quotes:
-            writer.writerow({
-                "text": quote["text"],
-                "author": quote["author"],
-                "tags": quote["tags"],
-            })
-
-    with open(
-            output_authors_csv_path, "w", newline="", encoding="utf-8"
-    ) as csvfile:
-        fieldnames = ["author", "bio"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for author in authors_data:
-            writer.writerow(author)
+    csv_writer = QuoteCSVWriter(output_csv_path)
+    csv_writer.write(all_quotes)
 
 
 if __name__ == "__main__":
-    main("quotes.csv", "authors.csv")
+    main("quotes.csv")
